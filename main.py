@@ -100,8 +100,12 @@ async def analyze_card(file: UploadFile = File(...)):
     else:
         result_text = "Analysis Failed: กรุณาวางการ์ดให้ตรงขึ้น"
 
+    # Convert output image to base64 for the result
     _, buffer = cv2.imencode('.jpg', output_img)
+    base64_image = base64.b64encode(buffer).decode('utf-8')
+
+    # Return the results in the same format
     return {
         "centering": result_text,
-        "visual_result": f"data:image/jpeg;base64,{base64.b64encode(buffer).decode('utf-8')}"
+        "visual_result": f"data:image/jpeg;base64,{base64_image}"
     }
