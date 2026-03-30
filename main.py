@@ -29,86 +29,85 @@ async def analyze_card(file: UploadFile = File(...)):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    # 1. หาขอบนอกด้วย Canny แบบ Auto
+    # 1. หาขอบนอกด้วย Canny Auto แบบจูนค่าให้กว้าง
     v = np.median(blurred)
     edged = cv2.Canny(blurred, int(max(0, (1.0 - 0.33) * v)), int(min(255, (1.0 + 0.33) * v)))
     edged = cv2.dilate(edged, np.ones((5,5), np.uint8), iterations=1)
 
     contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours: return {"error": "ไม่พบการ์ด"}
+    if not contours: return {"error": "หาการ์ดไม่เจอ ลองขยับมุมกล้องครับ"}
 
-    # หา Contour ที่ใหญ่ที่สุด และแปลงเป็น 4 มุม
     card_cnt = max(contours, key=cv2.contourArea)
     peri = cv2.arcLength(card_cnt, True)
     approx = cv2.approxPolyDP(card_cnt, 0.02 * peri, True)
 
     centering_text = "Analysis Failed: วางการ์ดให้เห็น 4 มุมชัดเจน"
 
-    # ถ้าเจอ 4 มุมเป๊ะๆ (นี่คือสิ่งที่ Pro App ทำ)
     if len(approx) == 4:
-        # --- ขั้นที่ 1: ดัดภาพให้ตรง (Warp) ---
         rect = order_points(approx.reshape(4, 2))
         (tl, tr, br, bl) = rect
         
-        # วาดเส้นขอบนอกลงบนรูป Raw
+        # วาดเส้นขอบนอกแบบนิ่งๆ
         cv2.polylines(output_img, [np.int32(rect)], True, (0, 255, 0), 6)
 
-        # กำหนดขนาด Canvas จำลองเพื่อวัดสัดส่วน (ใช้สัดส่วน 2.5 x 3.5)
-        maxWidth, maxHeight = 500, 700
-        dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
+        # ----------------------------------------------------------------------
+        # หัวใจใหม่: GrabCut (ลบพื้นหลัง) เพื่อความแม่นยำสูงสุด
+        # ----------------------------------------------------------------------
+        # สร้าง ROI สำหรับ GrabCut รอบๆ การ์ดที่เจอ
+        x_min, y_min = np.int32(np.min(rect, axis=0))
+        x_max, y_max = np.int32(np.max(rect, axis=0))
+        h_card, w_card = (y_max - y_min), (x_max - x_min)
         
-        # สร้าง Matrix M (สำหรับดัดตรง) และ M_inv (สำหรับแปลงกลับ)
-        M = cv2.getPerspectiveTransform(rect, dst)
-        M_inv = np.linalg.inv(M)
-        
-        warped = cv2.warpPerspective(gray, M, (maxWidth, maxHeight))
+        # รัน GrabCut (5 ครั้ง)
+        mask = np.zeros(img.shape[:2], np.uint8)
+        bgdModel = np.zeros((1, 65), np.float64)
+        fgdModel = np.zeros((1, 65), np.float64)
+        rect_gc = (x_min, y_min, w_card, h_card)
+        cv2.grabCut(img, mask, rect_gc, bgdModel, fgdModel, 5, cv2.GC_INIT_WITH_RECT)
+        mask_fg = np.where((mask==2)|(mask==0), 0, 1).astype('uint8')
+        img_fg = img * mask_fg[:,:,np.newaxis] # ได้รูปการ์ดที่ตัดพื้นหลังออกทั้งหมด
 
-        # --- ขั้นที่ 2: หาขอบใน (Artwork) จากรูปที่แบนราบ 100% ---
-        # บนรูปที่ตรงแล้ว การหาขอบในจะง่ายและแม่นยำมาก
-        w_thresh = cv2.adaptiveThreshold(warped, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
-        inner_cnts, _ = cv2.findContours(w_thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        # ----------------------------------------------------------------------
+        # หาขอบในจากรูปที่ตัดพื้นหลังแล้ว (Precision Mode)
+        # ----------------------------------------------------------------------
+        fg_gray = cv2.cvtColor(img_fg, cv2.COLOR_BGR2GRAY)
+        fg_gray = fg_gray[y_min:y_max, x_min:x_max] # โฟกัสเฉพาะตัวการ์ด
+        fg_thresh = cv2.adaptiveThreshold(fg_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                          cv2.THRESH_BINARY_INV, 11, 2)
+        inner_cnts, _ = cv2.findContours(fg_thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
         best_inner = None
         min_dist = float('inf')
         
         for cnt in inner_cnts:
             ix, iy, iw, ih = cv2.boundingRect(cnt)
-            area = iw * ih
-            # เช็คว่าขนาดใกล้เคียง Artwork ไหม (40% - 85% ของ 500x700)
-            if (350000 * 0.4) < area < (350000 * 0.85):
-                # หาตัวที่อยู่ใกล้จุดกึ่งกลางที่สุด
-                dist = abs((ix + iw/2) - maxWidth/2) + abs((iy + ih/2) - maxHeight/2)
-                if dist < min_dist:
-                    min_dist = dist
+            iarea = iw * ih
+            # Artwork ปกติจะกินพื้นที่ 40% - 85% ของการ์ด
+            if (h_card * w_card * 0.4) < iarea < (h_card * w_card * 0.85):
+                # ตรวจสอบว่าอยู่กึ่งกลางของการ์ด ROI ไหม
+                dist = abs((ix + iw/2) - w_card/2) + abs((iy + ih/2) - h_card/2)
+                if dist < (w_card * 0.2): # ต้องอยู่ไม่ไกลจากกลางการ์ดมาก
                     best_inner = (ix, iy, iw, ih)
+                    break
 
-        # --- ขั้นที่ 3: คำนวณและแปลงพิกัดกลับไปวาดบนรูป Raw ---
         if best_inner:
             ix, iy, iw, ih = best_inner
             
-            # คำนวณ Centering บน Canvas 500x700 (แม่นยำ 100%)
-            left, right = ix, maxWidth - (ix + iw)
-            top, bottom = iy, maxHeight - (iy + ih)
+            # คำนวณ Ratio
+            left, right = ix, w_card - (ix + iw)
+            top, bottom = iy, h_card - (iy + ih)
             lr_ratio = round((left / (left + right)) * 100) if (left + right) > 0 else 50
             tb_ratio = round((top / (top + bottom)) * 100) if (top + bottom) > 0 else 50
             centering_text = f"L/R: {lr_ratio}/{100-lr_ratio} T/B: {tb_ratio}/{100-tb_ratio}"
 
-            # สร้างพิกัด 4 มุมของขอบใน (บน Canvas แบนราบ)
-            inner_rect = np.array([
-                [ix, iy], [ix + iw, iy], 
-                [ix + iw, iy + ih], [ix, iy + ih]
-            ], dtype="float32").reshape(-1, 1, 2)
-
-            # ใช้ Inverse Matrix แปลงพิกัดกลับไปสู่มุมมองกล้องเอียงๆ
-            transformed_inner = cv2.perspectiveTransform(inner_rect, M_inv)
-            
-            # วาดเส้นขอบในสีทอง ลงบนรูป Raw ด้วยพิกัดที่แปลงแล้ว
-            cv2.polylines(output_img, [np.int32(transformed_inner)], True, (0, 215, 255), 8)
+            # วาดขอบในสีทอง (VaultLive) ลงบนรูป Raw ด้วยพิกัดที่แปลงแล้ว
+            cv2.rectangle(output_img, (ix + x_min, iy + y_min), 
+                          (ix + x_min + iw, iy + y_min + ih), (0, 215, 255), 8)
     else:
         # Fallback กรณีหา 4 มุมไม่เจอ
         x, y, w, h = cv2.boundingRect(card_cnt)
         cv2.rectangle(output_img, (x, y), (x + w, y + h), (0, 255, 0), 6)
-        centering_text = "หา 4 มุมไม่เจอ: กรุณาวางบนพื้นสีเข้มและถ่ายให้เห็นขอบชัดเจน"
+        centering_text = "หาขอบจาง: กรุณาถ่ายใหม่บนพื้นสีเข้มและนิ่งครับ"
 
     # แปลง Base64
     _, buffer = cv2.imencode('.jpg', output_img)
