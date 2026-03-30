@@ -14,81 +14,89 @@ async def analyze_card(file: UploadFile = File(...)):
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None: return {"error": "Invalid image"}
 
-    # --- Step 1: ค้นหาขอบการ์ดนอก (Outer Edge) ---
-    orig_w, orig_h = img.shape[:2]
+    # --- 1. ยกระดับการหาขอบ (Advanced Edge Detection) ---
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
     
-    # ใช้ Canny ที่ปรับค่าตามความสว่างภาพอัตโนมัติ
-    v = np.median(gray)
-    lower = int(max(0, (1.0 - 0.33) * v))
-    upper = int(min(255, (1.0 + 0.33) * v))
-    edged = cv2.Canny(blurred, lower, upper)
+    # ใช้ Bilateral Filter เพื่อลด Noise แต่ "รักษาความคมของขอบ" (ดีกว่า Gaussian)
+    blurred = cv2.bilateralFilter(gray, 9, 75, 75)
     
-    # ขยายเส้นขอบเล็กน้อยเพื่อให้เชื่อมกัน
-    kernel = np.ones((5,5), np.uint8)
-    edged = cv2.dilate(edged, kernel, iterations=1)
-
-    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # ใช้ Scharr Operator หาการเปลี่ยนแปลงของแสง (Gradient) ทั้งแนวตั้งและแนวนอน
+    gradX = cv2.Scharr(blurred, ddepth=cv2.CV_32F, dx=1, dy=0)
+    gradY = cv2.Scharr(blurred, ddepth=cv2.CV_32F, dx=0, dy=1)
+    gradient = cv2.subtract(gradX, gradY)
+    gradient = cv2.convertScaleAbs(gradient)
     
-    if not contours: return {"error": "ไม่พบการ์ดในภาพ"}
+    # ปิดช่องว่างของเส้นขอบด้วย Morphological Operations
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 7))
+    closed = cv2.morphologyEx(gradient, cv2.MORPH_CLOSE, kernel)
+    _, thresh = cv2.threshold(closed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # เลือก Contour ที่ใหญ่ที่สุด (ตัวการ์ด)
-    card_cnt = max(contours, key=cv2.contourArea)
-    x, y, w, h = cv2.boundingRect(card_cnt)
-    card_area = w * h
-
-    # --- Step 2: ค้นหาขอบ Artwork ใน (Inner Edge) จากรูป RAW ---
-    # ใช้ Adaptive Threshold สู้แสงสะท้อนบนรูป RAW
-    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                   cv2.THRESH_BINARY_INV, 11, 2)
-    inner_contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-
-    possible_artworks = []
-    card_center_x, card_center_y = x + (w/2), y + (h/2)
+    # --- 2. ค้นหาสี่เหลี่ยมที่ "หน้าตาเหมือนการ์ด" ที่สุด ---
+    contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    for cnt in inner_contours:
-        ix, iy, iw, ih = cv2.boundingRect(cnt)
-        area = iw * ih
-        # เงื่อนไข: ต้องมีพื้นที่ 30% - 85% ของพื้นที่การ์ด และต้องอยู่ใกล้จุดศูนย์กลางการ์ด
-        if (card_area * 0.3) < area < (card_area * 0.9):
-            # เช็คว่าอยู่กึ่งกลางของการ์ดไหม
-            dist = abs((ix + iw/2) - card_center_x) + abs((iy + ih/2) - card_center_y)
-            if dist < (w * 0.3): # ต้องอยู่ไม่ไกลจากกลางการ์ดมาก
-                possible_artworks.append((ix, iy, iw, ih, dist))
-
-    # เลือกสี่เหลี่ยมด้านในที่ "อยู่ใกล้จุดกึ่งกลางการ์ดที่สุด"
-    if possible_artworks:
-        best_inner = min(possible_artworks, key=lambda item: item[4])
-        ix, iy, iw, ih, _ = best_inner
+    best_cnt = None
+    max_score = 0
+    
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 50000: continue # ข้ามเศษขยะเล็กๆ
         
-        # --- Step 3: คำนวณ Centering จากรูป RAW ---
-        left_dist = ix - x
-        right_dist = (x + w) - (ix + iw)
-        top_dist = iy - y
-        bottom_dist = (y + h) - (iy + ih)
+        # ตรวจสอบสัดส่วน (Aspect Ratio)
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        x, y, w, h = cv2.boundingRect(cnt)
+        aspect_ratio = float(w)/h
         
-        lr_ratio = round((left_dist / (left_dist + right_dist)) * 100) if (left_dist + right_dist) > 0 else 50
-        tb_ratio = round((top_dist / (top_dist + bottom_dist)) * 100) if (top_dist + bottom_dist) > 0 else 50
+        # คะแนนความเป็นการ์ด: สัดส่วนควรอยู่ระหว่าง 0.6 - 0.8 (หรือ 1.2 - 1.6 แนวนอน)
+        score = 0
+        if 0.5 < aspect_ratio < 1.8: score += 50
+        if len(approx) == 4: score += 50 # ถ้าเป็นสี่เหลี่ยมเป๊ะจะได้คะแนนเพิ่ม
+        
+        if score >= max_score:
+            max_score = score
+            best_cnt = cnt
 
-        # --- Step 4: วาดเส้นตรงๆ ลงบนรูปต้นฉบับ (Raw) ---
-        output_img = img.copy()
-        
-        # 1. ขอบนอก (เขียว)
-        cv2.rectangle(output_img, (x, y), (x + w, y + h), (0, 255, 0), 6)
-        # 2. ขอบใน (ทอง VaultLive)
+    if best_cnt is None:
+        # ถ้าหาไม่เจอจริงๆ ให้ถอยกลับไปใช้รูป Raw โดยไม่วาดเส้น
+        return {"centering": "หาการ์ดไม่เจอ ลองขยับมุมกล้องครับ", "visual_result": f"data:image/jpeg;base64,{base64.b64encode(contents).decode('utf-8')}"}
+
+    # --- 3. หาขอบใน (Artwork) ด้วย Canny ที่ละเอียดขึ้น ---
+    x, y, w, h = cv2.boundingRect(best_cnt)
+    roi_gray = gray[y:y+h, x:x+w]
+    
+    # ใช้ Canny บนตัวการ์ดที่เจอแล้ว
+    inner_edged = cv2.Canny(roi_gray, 30, 100)
+    inner_contours, _ = cv2.findContours(inner_edged, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    
+    best_inner = None
+    for icnt in inner_contours:
+        ix, iy, iw, ih = cv2.boundingRect(icnt)
+        iarea = iw * ih
+        if (w * h * 0.3) < iarea < (w * h * 0.85):
+            # ตรวจสอบว่าอยู่กลางการ์ดไหม
+            if abs((ix + iw/2) - w/2) < (w * 0.15) and abs((iy + ih/2) - h/2) < (h * 0.15):
+                best_inner = (ix+x, iy+y, iw, ih)
+                break
+
+    # --- 4. วาดผลลัพธ์ ---
+    output_img = img.copy()
+    cv2.drawContours(output_img, [best_cnt], -1, (0, 255, 0), 6) # วาดขอบนอกตามรูปทรงจริง
+    
+    if best_inner:
+        ix, iy, iw, ih = best_inner
         cv2.rectangle(output_img, (ix, iy), (ix + iw, iy + ih), (0, 215, 255), 8)
-        # 3. เส้นกึ่งกลาง (แดง) เพื่อโชว์ความเบี่ยงเบน
-        cv2.line(output_img, (int(x+w/2), y), (int(x+w/2), y+h), (0, 0, 255), 2)
         
-        centering_text = f"L/R: {lr_ratio}/{100-lr_ratio} T/B: {tb_ratio}/{100-tb_ratio}"
+        # คำนวณ Ratio
+        l, r = ix - x, (x + w) - (ix + iw)
+        t, b = iy - y, (y + h) - (iy + ih)
+        lr_p = round(l/(l+r)*100) if (l+r)>0 else 50
+        tb_p = round(t/(t+b)*100) if (t+b)>0 else 50
+        res_text = f"L/R: {lr_p}/{100-lr_p} T/B: {tb_p}/{100-tb_p}"
     else:
-        output_img = img
-        centering_text = "Analysis Failed: กรุณาถ่ายใหม่บนพื้นหลังที่ตัดกัน"
+        res_text = "Found Card, but Inner Border hidden"
 
-    # แปลงเป็น Base64 ส่งกลับไป
     _, buffer = cv2.imencode('.jpg', output_img)
     return {
-        "centering": centering_text,
+        "centering": res_text,
         "visual_result": f"data:image/jpeg;base64,{base64.b64encode(buffer).decode('utf-8')}"
     }
