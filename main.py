@@ -7,7 +7,7 @@ import base64
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # อนุญาตให้ทุกที่เข้าถึงได้ (รวมถึงแอปเรา)
+    allow_origins=["*"],  # อนุญาตให้ทุกที่เข้าถึงได้ (รวมถึงแอปเรา)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -27,7 +27,7 @@ async def analyze_card(file: UploadFile = File(...)):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    # 2. หาขอบนอกสุดของการ์ด (Outer Edge)
+    # 2. หาขอบการ์ด (Outer Card Edge)
     edged = cv2.Canny(blurred, 50, 150)
     contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -36,7 +36,7 @@ async def analyze_card(file: UploadFile = File(...)):
     card_cnt = max(contours, key=cv2.contourArea)
     x, y, w, h = cv2.boundingRect(card_cnt)
     
-    # 3. ตัดเฉพาะตัวการ์ดออกมา (Crop) เพื่อหาขอบใน (Inner Artwork)
+    # 3. ตัดเฉพาะตัวการ์ด (Crop) เพื่อหาขอบใน (Inner Artwork)
     card_img = img[y:y+h, x:x+w]
     card_gray = cv2.cvtColor(card_img, cv2.COLOR_BGR2GRAY)
     
@@ -64,6 +64,7 @@ async def analyze_card(file: UploadFile = File(...)):
         # วาดเส้นไกด์แสดงขอบใน (สีเหลือง VaultLive)
         cv2.rectangle(card_img, (ix, iy), (ix + iw, iy + ih), (0, 215, 255), 3)
         
+        # เพิ่มข้อความแสดงผล
         centering_text = f"L/R: {lr_ratio_val}/{100-lr_ratio_val} T/B: {tb_ratio_val}/{100-tb_ratio_val}"
     else:
         centering_text = "Analysis Failed"
